@@ -52,7 +52,8 @@ class App:
         for s in [("zoom", "Picture zoom", .1, 5, 1, .05), ("sx", "Picture shift x", -3, 3, 0, .05),
                   ("sy", "Picture shift y", -3, 3, 0, .05), ("rot", "Picture rotation (deg)", 0, 360, 0, 1),
                   ("ocx", "Output centre x", -10, 10, 0, .1),
-                  ("ocy", "Output centre y", -10, 10, 0, .1)]:
+                  ("ocy", "Output centre y", -10, 10, 0, .1),
+                  ("ozoom", "Output zoom", .1, 20, 1, .05)]:      # <-- new
             self.slider(cols[0], *s)
 
         # Column 1: choice of the complex function + custom formula + branch-cut settings.
@@ -202,7 +203,7 @@ class App:
                           min(1.0, asp), asp, np.array(self.poly, dtype=complex),
                           np.array(self.poly_in, dtype=complex))
         # the window of the output plane that is shown (never rotated)
-        out_region = Region(complex(g("ocx"), g("ocy")), 4, 0.0)
+        out_region = Region(complex(g("ocx"), g("ocy")), 4 / g("ozoom"), 0.0)
         if fwd:
             return render_forward(self.src, tf, tp, src_region, out_region, size, fwd_over)
         return render_inverse(self.src, tf, tp, dp, src_region, out_region, size, ss)
