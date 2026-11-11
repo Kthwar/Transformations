@@ -57,6 +57,8 @@ def render_inverse(src, tf, tp, dp, src_region, out_region, out_size, ss=1):
                 filled = np.zeros((oh, ow), bool)
                 color = np.zeros((oh, ow, 3), np.float32)
                 for z, ok in tf.inverse(w, tp):    # nearest sheet first; first hit wins
+                    if filled.all():
+                        break
                     zl = to_local(z, src_region)
                     if dp.enabled:
                         zl = droste_pullback(zl, dp)

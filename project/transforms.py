@@ -32,6 +32,8 @@ class TParams:
     cuts_on: bool = True     # True: principal sheet only
     n: float = 2.0           # exponent for z^n
     n_sheets: int = 5        # how many sheets to composite when cuts are OFF
+    seed_center: complex = 0j  # Newton start points (custom f(z) only): centred on the picture
+    seed_radius: float = 2.0
 
 
 def arg_cut(z, theta0):
@@ -123,3 +125,64 @@ TRANSFORMS = {t.name: t for t in [
     Transform("cos(z)", lambda z, p: [np.cos(z)], _cos_i, 3.0),
     Transform("tan(z)", lambda z, p: [np.tan(z)], _tan_i, 3.0),
 ]}
+
+
+# =====================================================================================
+# CUSTOM FUNCTIONS  (typed by the user; variable is z, or w for an inverse; k = sheet index)
+# =====================================================================================
+_NS = {n: getattr(np, n) for n in ["sin", "cos", "tan", "exp", "log", "sqrt", "sinh", "cosh", "tanh",
+                                   "arcsin", "arccos", "arctan", "arcsinh", "arccosh", "arctanh",
+                                   "conj", "abs", "real", "imag", "angle", "power"]}
+_NS.update(pi=np.pi, e=np.e, i=1j, j=1j, ln=np.log, asin=np.arcsin, acos=np.arccos, atan=np.arctan)
+
+
+def _compile(expr, var):
+    """Turn text like 'z^2 + 1' into a vectorised function of `var` (and the sheet index k).
+    eval() with no builtins -- fine for a local tool where you type your own formulas."""
+    code = compile(expr.replace("^", "**"), "<custom>", "eval")
+    def fn(x, k=0):
+        ns = dict(_NS); ns[var] = x; ns["k"] = k
+        return eval(code, {"__builtins__": {}}, ns) + 0 * x      # "+ 0*x" broadcasts constants
+    return fn
+
+
+_SEEDS = [0, 1, -1, 1j, -1j, 1 + 1j, -1 + 1j, -1 - 1j, 1 - 1j]   # 3x3 grid of Newton start points
+
+
+def _newton(f, w, z0, iters=40):
+    """Solve f(z) = w for every pixel at once.  Newton: z <- z - (f(z)-w)/f'(z), where for an
+    analytic f the derivative is the complex difference quotient f'(z) ~ (f(z+h)-f(z))/h.
+    Steps are capped at length 1 for stability.  Pixels whose residual stays large are
+    flagged invalid (they become transparent) instead of showing garbage."""
+    z, h = z0.copy(), 1e-6
+    for _ in range(iters):
+        fz = f(z)
+        step = (fz - w) / ((f(z + h) - fz) / h)
+        step = np.where(np.abs(step) > 1, step / np.abs(step), step)
+        z = z - np.where(np.isfinite(step), step, 0)
+    ok = np.isfinite(z) & (np.abs(f(z) - w) < 1e-6 * (1 + np.abs(w)))
+    return z, ok
+
+
+def make_custom(expr, mode):
+    """mode 'inverse': expr is f^-1(w) (may use k for multi-valued sheets) -> used directly.
+       mode 'forward': expr is f(z) -> inverted numerically by Newton from several start points;
+       each start point can land on a different preimage (= a different 'sheet').  Cuts ON uses
+       one start point, cuts OFF uses `n_sheets` of them.  Root-finding can fail or pick odd
+       roots near critical points of f -- supplying the true inverse is more reliable."""
+    f = _compile(expr, "w" if mode == "inverse" else "z")
+    f(np.array([0.5 + 0.5j]))                     # fail early on typos / unknown names
+    if mode == "inverse":
+        def inv(w, p):
+            for k in sheet_indices(p):
+                z = f(w, k)
+                yield z, np.isfinite(z)
+        def fwd(z, p):
+            raise NotImplementedError("Forward demo needs f(z); you supplied only the inverse.")
+    else:
+        def fwd(z, p):
+            return [f(z)]
+        def inv(w, p):
+            for s in _SEEDS[:1 if p.cuts_on else p.n_sheets]:
+                yield _newton(f, w, np.full(w.shape, p.seed_center + 0.6 * p.seed_radius * s, complex))
+    return Transform("custom", fwd, inv, 4.0)

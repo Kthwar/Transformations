@@ -1,82 +1,118 @@
 """
-droste.py -- the Droste engine, written as a PULL-BACK: given a point z of the picture
-plane, return the point z' whose colour we should show.  Coordinates are "picture-local":
-the picture spans x in [-1, 1] (so a radius of 1 = half the picture's width).
+droste.py -- the Droste engine, written as a PULL-BACK: given a point z of the picture plane
+it returns the point z' whose colour should be shown.  Coordinates are "picture-local":
+the picture spans x in [-1, 1] (radius 1 = half the picture's width), y in [-h, h], h = H/W.
+Every model assumes the picture contains a smaller copy of itself (rotated by psi) and
+replaces whatever is inside by an enlarged copy of the picture, again and again.
 
-MODEL A: ANNULUS / ESCHER (conformal log-spiral tiling)
-  Assume the picture contains a smaller copy of itself between radii r1 < r2 around the
-  centre c (ratio R = r2/r1, L = ln R).
-  1. w = ln(z - c) = ln r + i*theta.  Scaling z by R is now a TRANSLATION of w by L.
-  2. w' = (alpha + i*beta) * w.  Multiplying by a complex number = scale + rotate in the
-     log plane; beta != 0 makes the copies spiral.   [u + iv = w']
-  3. Self-similarity means u is only meaningful modulo L, so wrap u into [ln r1, ln r2):
-        u' = u - n*L,  n = floor((u - ln r1)/L)
-  4. z' = c + exp(u' + i*v).  exp is conformal, so every tile is an undistorted
-     (angle-preserving) copy.
-  SEAMLESS condition: going once around (w -> w + 2*pi*i) shifts w' by 2*pi*i*(alpha+i*beta)
-  = 2*pi*i*alpha - 2*pi*beta.  exp ignores 2*pi*i*alpha only if alpha is an integer, and the
-  wrap ignores -2*pi*beta only if it's a multiple of L, i.e. beta = p*L/(2*pi), p = number
-  of spiral arms.  Otherwise a visible seam appears along the branch cut at theta0.
-  `depth` limits how many nested levels (n = -1 ... -depth) get the recursion; deeper
-  points show the picture unchanged.
+MODEL A -- ANNULUS (conformal log map).  Inner copy = scaled by 1/R (R = r2/r1), rotated by psi.
+  1. w = ln(z - c) = ln r + i*theta.   Scaling by R is the translation w -> w + L, L = ln R;
+     rotating by psi is w -> w + i*psi.  The whole self-similarity is ONE translation
+     tau = L - i*psi of the log plane.
+  2. Level n = floor((Re w - ln r1)/L) says how many copies deep we are.  Undo them:
+     w' = w - n*tau   (only for -depth <= n < 0; deeper points keep the original content).
+  3. z' = c + exp(w').   exp is conformal, so each copy is an undistorted similar copy.
+  (No branch-cut seam here: ln's arg jumps by 2*pi*i across the cut, and exp(w') ignores that.)
 
-MODEL B: NESTED COPY (iterated similarity)
-  The picture's inscribed disc is shrunk into a disc (centre c, radius rho): that is the
-  similarity T(z) = c + s*e^{i*psi}*z with s = rho/frame_radius.  For a pixel inside the
-  disc we apply T^{-1} (blow it back up to full picture size) and repeat up to `depth`
-  times, until the point lands outside the disc (= ordinary picture content).
+MODEL B -- DISC.  T(z) = c + s*e^{i*psi}*z shrinks the picture's inscribed disc (radius
+  frame_radius) into the disc (centre c, radius rho), s = rho/frame_radius.  A pixel inside the
+  disc is pulled back with T^{-1}; repeat up to `depth` times.
+
+MODEL C -- DRAWN REGION (polygon).  A pixel inside the polygon P is pulled back to picture
+  coordinates, repeated up to `depth` times:
+    * 4 points = the corners of the inner copy in the order TL, TR, BR, BL.  The map picture
+      rectangle -> quad is a homography (projective map, handles tilted / perspective frames);
+      we apply its inverse.   (Not conformal, but exact for rectangles & perspective.)
+    * other point counts = free shape: the copy is the picture scaled to fit the polygon's
+      bounding box, shown only inside the polygon.
+  psi rotates the inner copy in B and C as well (after the pull-back).
 """
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import numpy as np
-from transforms import arg_cut
 
 
 @dataclass
 class DrosteParams:
     enabled: bool = False
-    model: str = "annulus"        # "annulus" or "nested"
+    model: str = "annulus"        # "annulus" | "disc" | "polygon"
     center: complex = 0j
     r1: float = 0.2
     r2: float = 0.8
-    alpha: float = 1.0
-    beta: float = 0.0
-    seamless: bool = True         # snap alpha to an integer, beta = arms*L/(2*pi)
-    arms: int = 1
+    rho: float = 0.4
+    psi: float = 0.0              # rotation of the inner copy (radians)
     depth: int = 6
-    rho: float = 0.4              # nested model: radius of the inner disc
-    psi: float = 0.0              # nested model: rotation of the inner copy (radians)
-    frame_radius: float = 1.0     # radius of the picture's inscribed disc, in local units
-    theta0: float = -np.pi        # branch cut of the ln(z - c) used by the annulus model
+    frame_radius: float = 1.0     # inscribed-disc radius of the picture, local units
+    aspect: float = 1.0           # h = H/W
+    poly: np.ndarray = field(default_factory=lambda: np.zeros(0, complex))
 
 
 def droste_annulus(z, dp):
     r2 = max(dp.r2, dp.r1 * 1.05)
     L = np.log(r2 / dp.r1)
-    if dp.seamless:
-        a, b = max(1.0, round(dp.alpha)), dp.arms * L / (2 * np.pi)
-    else:
-        a, b = dp.alpha, dp.beta
-    d = z - dp.center
-    w = np.log(np.abs(d)) + 1j * arg_cut(d, dp.theta0)      # step 1: log coordinates
-    wp = (a + 1j * b) * w                                    # step 2: scale + rotate
-    u, v = wp.real, wp.imag
-    n = np.floor((u - np.log(dp.r1)) / L)                    # which level of the tiling?
-    wrap = (n < 0) & (n >= -dp.depth)                        # recurse only `depth` levels
-    u2 = np.where(wrap, u - n * L, u)                        # step 3: u modulo L
-    return dp.center + np.exp(u2 + 1j * v)                   # step 4: back with exp
+    tau = L - 1j * dp.psi                                    # the single self-similarity translation
+    w = np.log(z - dp.center)                                # step 1
+    n = np.floor((w.real - np.log(dp.r1)) / L)               # step 2: copy level
+    w2 = np.where((n < 0) & (n >= -dp.depth), w - n * tau, w)
+    return dp.center + np.exp(w2)                            # step 3
 
 
-def droste_nested(z, dp):
-    s = dp.rho / dp.frame_radius
-    rot = np.exp(-1j * dp.psi)
+def droste_disc(z, dp):
+    s, rot = dp.rho / dp.frame_radius, np.exp(-1j * dp.psi)
     z = z.copy()
     for _ in range(dp.depth):
         inside = np.abs(z - dp.center) < dp.rho              # NaN compares False -> untouched
         if not inside.any():
             break
-        z[inside] = (z[inside] - dp.center) * rot / s        # T^{-1}: enlarge back to picture size
+        z[inside] = (z[inside] - dp.center) / s * rot        # T^{-1}, then rotate the copy
+    return z
+
+
+def in_polygon(z, P):
+    """Even-odd rule: a ray towards +x crosses an odd number of edges iff z is inside."""
+    x, y, inside, j = z.real, z.imag, np.zeros(z.shape, bool), len(P) - 1
+    for i in range(len(P)):
+        cross = ((P[i].imag > y) != (P[j].imag > y)) & \
+                (x < (P[j].real - P[i].real) * (y - P[i].imag) / (P[j].imag - P[i].imag + 1e-300) + P[i].real)
+        inside ^= cross
+        j = i
+    return inside
+
+
+def homography(src, dst):
+    """3x3 projective map sending 4 points src -> dst (complex numbers as x+iy); direct linear solve."""
+    A, b = [], []
+    for s, d in zip(src, dst):
+        x, y, X, Y = s.real, s.imag, d.real, d.imag
+        A += [[x, y, 1, 0, 0, 0, -X * x, -X * y], [0, 0, 0, x, y, 1, -Y * x, -Y * y]]
+        b += [X, Y]
+    return np.append(np.linalg.solve(A, b), 1).reshape(3, 3)
+
+
+def apply_homography(Hm, z):
+    x, y = z.real, z.imag
+    d = Hm[2, 0] * x + Hm[2, 1] * y + 1
+    return ((Hm[0, 0] * x + Hm[0, 1] * y + Hm[0, 2]) + 1j * (Hm[1, 0] * x + Hm[1, 1] * y + Hm[1, 2])) / d
+
+
+def droste_polygon(z, dp):
+    P, h, rot = dp.poly, dp.aspect, np.exp(-1j * dp.psi)
+    if len(P) < 3:
+        return z
+    if len(P) == 4:
+        Hm = homography(P, np.array([-1 + 1j * h, 1 + 1j * h, 1 - 1j * h, -1 - 1j * h]))
+        back = lambda q: apply_homography(Hm, q) * rot
+    else:
+        c0 = complex((P.real.min() + P.real.max()) / 2, (P.imag.min() + P.imag.max()) / 2)
+        s = max(min((P.real.max() - P.real.min()) / 2, (P.imag.max() - P.imag.min()) / 2 / h), 1e-6)
+        back = lambda q: (q - c0) / s * rot
+    z = z.copy()
+    for _ in range(dp.depth):
+        inside = in_polygon(z, P)
+        if not inside.any():
+            break
+        z[inside] = back(z[inside])
     return z
 
 
 def droste_pullback(z, dp):
-    return droste_annulus(z, dp) if dp.model == "annulus" else droste_nested(z, dp)
+    return {"annulus": droste_annulus, "disc": droste_disc, "polygon": droste_polygon}[dp.model](z, dp)
