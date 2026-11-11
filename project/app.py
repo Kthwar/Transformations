@@ -29,6 +29,7 @@ class App:
         # custom_tf: the compiled custom function; poly / poly_in: output / input Droste frames
         self.val, self.chk, self.custom_tf, self.poly, self.poly_in = {}, {}, None, [], []
         self.dw = self.dh = PREVIEW; self.ah = 1.0           # displayed size / aspect of the original
+        self.ox = self.oy = 0                                  # image centering offsets on canvas
         root.title("TMA: complex maps and Droste effect")
 
         # ---- the two image canvases (left: original, right: result) ----
@@ -162,8 +163,8 @@ class App:
 
     # ---- drawn Droste frames (picture-local coords: x in [-1,1], y in [-h,h]) ----------
     # Canvas pixels <-> picture-local complex numbers.  Canvas y grows downward, Im grows upward.
-    def to_canvas(self, z): return (z.real + 1) / 2 * self.dw, (1 - z.imag / self.ah) / 2 * self.dh
-    def from_canvas(self, x, y): return complex(2 * x / self.dw - 1, (1 - 2 * y / self.dh) * self.ah)
+    def to_canvas(self, z): return (z.real + 1) / 2 * self.dw + self.ox, (1 - z.imag / self.ah) / 2 * self.dh + self.oy
+    def from_canvas(self, x, y): return complex(2 * (x - self.ox) / self.dw - 1, (1 - 2 * (y - self.oy) / self.dh) * self.ah)
 
     def active_poly(self):
         """The polygon (list of points) the clicks currently edit."""
@@ -171,7 +172,7 @@ class App:
 
     def add_point(self, ev):
         """Left click on the original: append a vertex to the active polygon."""
-        if self.src is None or ev.x > self.dw or ev.y > self.dh: return   # ignore clicks outside the picture
+        if self.src is None or not (self.ox <= ev.x <= self.ox + self.dw and self.oy <= ev.y <= self.oy + self.dh): return   # ignore clicks outside the picture
         self.active_poly().append(self.from_canvas(ev.x, ev.y)); self.model.set("polygon"); self.schedule()
 
     def pop_point(self, _):
@@ -227,8 +228,10 @@ class App:
         """Crosshair, Droste circles and the drawn polygons (all tagged 'ov' so they can be wiped)."""
         self.cv_in.delete("ov"); self.cv_out.delete("ov")
         if self.chk["cross"].get():
-            for cv, (w, h) in ((self.cv_in, (self.dw, self.dh)), (self.cv_out, (PREVIEW, PREVIEW))):
-                cv.create_line(w / 2, 0, w / 2, h, fill="red", tags="ov"); cv.create_line(0, h / 2, w, h / 2, fill="red", tags="ov")
+            self.cv_in.create_line(self.ox + self.dw / 2, self.oy, self.ox + self.dw / 2, self.oy + self.dh, fill="red", tags="ov")
+            self.cv_in.create_line(self.ox, self.oy + self.dh / 2, self.ox + self.dw, self.oy + self.dh / 2, fill="red", tags="ov")
+            self.cv_out.create_line(PREVIEW / 2, 0, PREVIEW / 2, PREVIEW, fill="red", tags="ov")
+            self.cv_out.create_line(0, PREVIEW / 2, PREVIEW, PREVIEW / 2, fill="red", tags="ov")
         if self.src is None: return
         m, v = self.model.get(), self.val
         # models A and B: show the circles (solid = r1 or rho, dashed = r2) on the original
@@ -255,8 +258,10 @@ class App:
         sh, sw = self.src.shape[:2]; self.ah = sh / sw
         im = Image.fromarray(self.src.astype("uint8")); im.thumbnail((PREVIEW, PREVIEW))
         self.dw, self.dh = im.size                            # displayed size (keeps the aspect ratio)
+        self.ox = (PREVIEW - self.dw) // 2                    # horizontal centering offset
+        self.oy = (PREVIEW - self.dh) // 2                    # vertical centering offset
         self.tk_in = ImageTk.PhotoImage(im)
-        self.cv_in.delete("all"); self.cv_in.create_image(0, 0, anchor="nw", image=self.tk_in)
+        self.cv_in.delete("all"); self.cv_in.create_image(self.ox, self.oy, anchor="nw", image=self.tk_in)
         self.redraw()
 
     def save(self):
@@ -271,4 +276,6 @@ class App:
 
 
 if __name__ == "__main__":
-    root = tk.Tk(); App(root); root.mainloop()
+    root = tk.Tk()
+    App(root)
+    root.mainloop()
