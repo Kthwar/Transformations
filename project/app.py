@@ -9,7 +9,9 @@ Droste model C has TWO polygons you can draw on the original (choose which one w
     input frame  (orange) = which part of the picture the copy shows (empty = whole picture)
 The custom formula can use the constants a, b, c, d, each controlled by its own slider.
 """
+import cmath
 import math
+import re
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 import numpy as np
@@ -20,6 +22,41 @@ from droste import DrosteParams
 from render import load_image, render_inverse, render_forward, composite_preview
 
 BASE_W, PREVIEW = 4.0, 420    # picture is BASE_W plane-units wide at zoom 1; PREVIEW = canvas size in px
+PAD, PAD_RANGE, PAD_COLS = 160, 5.0, 4   # 2D constant pads: size in px, covers -PAD_RANGE..PAD_RANGE on both axes,
+                                         # pads per row (4 = one compact row; 2 with PAD=100 = bigger 2x2 grid, taller window)
+
+# ---- expressions typed into the number boxes ---------------------------------------------
+# Names usable there (cmath = complex-aware, so sqrt(-4) = 2i instead of an error).
+_BOX_NS = {n: getattr(cmath, n) for n in ["sin", "cos", "tan", "exp", "log", "sqrt", "sinh", "cosh", "tanh",
+                                          "asin", "acos", "atan", "asinh", "acosh", "atanh"]}
+_BOX_NS.update(pi=math.pi, e=math.e, tau=math.tau, i=1j, j=1j, ln=cmath.log, arg=cmath.phase,
+               abs=abs, conj=lambda z: complex(z).conjugate(), real=lambda z: complex(z).real,
+               imag=lambda z: complex(z).imag, deg=math.radians)
+_IMPLICIT_I = re.compile(r"(?<![A-Za-z_0-9.])(\d+\.?\d*|\.\d+)i(?![A-Za-z_0-9])")   # "2i" -> "2*i"
+
+
+def eval_box(text):
+    """Evaluate a typed expression (e.g. '2*pi/3', '1+2i', 'exp(i*pi/4)', 'sqrt(2)^3') to a complex number.
+    eval() with no builtins -- fine for a local tool where you type your own input."""
+    text = _IMPLICIT_I.sub(r"\1*i", text.strip().replace("^", "**").replace(",", "."))
+    z = complex(eval(compile(text, "<box>", "eval"), {"__builtins__": {}}, _BOX_NS))
+    if not (math.isfinite(z.real) and math.isfinite(z.imag)): raise ValueError("not finite")
+    return z
+
+
+def eval_real(text):
+    """Like eval_box, but the result must be a real number (tiny imaginary rounding noise is dropped)."""
+    z = eval_box(text)
+    if abs(z.imag) > 1e-9 * max(1.0, abs(z.real)): raise ValueError("result is complex, a real number is needed")
+    return z.real
+
+
+def fmt_complex(z):
+    """Complex number -> short text that eval_box reads back, e.g. 1.5-2i, 3, -0.5i."""
+    re_, im = z.real + 0.0, z.imag + 0.0                   # "+ 0.0" turns -0.0 into 0.0
+    if im == 0: return f"{re_:g}"
+    if re_ == 0: return f"{im:g}i"
+    return f"{re_:g}{'+' if im > 0 else '-'}{abs(im):g}i"
 
 
 class App:
@@ -63,7 +100,7 @@ class App:
         self.combo.bind("<<ComboboxSelected>>", self.on_transform)
         self.expr, self.cmode = tk.StringVar(value="log(w) + 2*pi*i*k"), tk.StringVar(value="inverse")
         ttk.Label(c1, text="Custom: variable z (or w), k = sheet, i = imaginary unit,\n"
-                           "a b c d = constants (sliders), e.g.  a*log(w) + b + 2*pi*i*k").pack(anchor="w")
+                           "a b c d = complex constants, e.g.  a*log(w) + b + 2*pi*i*k").pack(anchor="w")
         e = ttk.Entry(c1, textvariable=self.expr); e.pack(fill="x"); e.bind("<Return>", lambda _: self.apply_custom())
         for txt, val in [("expression is the INVERSE f^-1(w)", "inverse"), ("expression is f(z) (numeric inverse)", "forward")]:
             ttk.Radiobutton(c1, text=txt, variable=self.cmode, value=val).pack(anchor="w")
@@ -97,10 +134,11 @@ class App:
                   ("depth", "Max recursion depth", 1, 12, 6, 1), ("export", "Export size (px)", 400, 4000, 1600, 100)]:
             self.slider(cols[3], *s)
         # One slider per constant a, b, c, d usable inside the custom formula.
-        cf = ttk.LabelFrame(cols[3], text="Custom-function constants")
+        cf = ttk.LabelFrame(cols[3], text="Custom-function constants (complex)")
         cf.pack(fill="x", pady=4)
-        for name in CONST_NAMES:
-            self.slider(cf, f"const_{name}", f"Constant {name}", -5, 5, DEFAULT_CONSTS[name], .01)
+        for idx, name in enumerate(CONST_NAMES):              # grid of 2D pads (x = real part, y = imaginary part)
+            cell = ttk.Frame(cf); cell.grid(row=idx // PAD_COLS, column=idx % PAD_COLS, padx=1, pady=1)
+            self.cpad(cell, f"const_{name}", name, DEFAULT_CONSTS[name])
         for txt, cmd in [("Open image...", self.open_image), ("Save output (PNG)...", self.save),
                          ("Clear output frame", self.clear_poly), ("Clear input frame", self.clear_poly_in)]:
             ttk.Button(cols[3], text=txt, command=cmd).pack(fill="x")
@@ -126,9 +164,11 @@ class App:
             self.val[key] = float(x); sv.set(f"{float(x):g}"); self.schedule()
 
         def on_entry(_=None):
-            """Enter / focus-out in the number box: parse it, move the Scale, redraw."""
-            try: x = float(sv.get())
-            except ValueError: sv.set(f"{self.val[key]:g}"); return   # bad text -> restore the old value
+            """Enter / focus-out in the number box: evaluate it, move the Scale, redraw."""
+            try: x = eval_real(sv.get())                      # the box accepts expressions: pi/2, 3*2, sqrt(2) ...
+            except Exception as err:                          # bad text -> restore the old value
+                sv.set(f"{self.val[key]:g}"); self.status.set(f"'{label}': {err}"); return
+            if x == self.val[key]: return                     # nothing changed (e.g. plain focus-out)
             self.val[key] = x; sc.set(x); self.schedule()
 
         sc = tk.Scale(parent, from_=lo, to=hi, resolution=res, orient="horizontal", showvalue=False,
@@ -140,6 +180,53 @@ class App:
         """Checkbox whose BooleanVar is stored in self.chk[key]; toggling it redraws."""
         self.chk[key] = tk.BooleanVar(value=default)
         ttk.Checkbutton(parent, text=label, variable=self.chk[key], command=self.schedule).pack(anchor="w")
+
+    def cpad(self, parent, key, label, default, rng=PAD_RANGE):
+        """2D slider for a COMPLEX number: x axis = real part, y axis = imaginary part.
+        Drag (or click) on the pad (centre = 0), or type an expression in the box below it ('1+2i', '2*exp(i*pi/4)').
+        Typed values may lie outside the pad; the marker then sticks to the border and turns red.
+        self.val[key] (a complex number) is the single source of truth."""
+        self.val[key] = complex(default)
+        cv = tk.Canvas(parent, width=PAD, height=PAD, bg="#222", highlightthickness=1, highlightbackground="#888")
+        cv.pack()
+        sv = tk.StringVar(value=fmt_complex(self.val[key]))
+        ent = ttk.Entry(parent, textvariable=sv, width=9, justify="center"); ent.pack()
+        to_px = lambda z: ((z.real / rng + 1) / 2 * PAD, (1 - z.imag / rng) / 2 * PAD)   # complex -> canvas pixel
+        from_px = lambda x, y: complex((2 * x / PAD - 1) * rng, (1 - 2 * y / PAD) * rng)  # canvas pixel -> complex
+
+        def draw():
+            cv.delete("all")
+            for t in (-rng / 2, 0, rng / 2):                     # grid lines at -rng/2, 0, +rng/2
+                p = (t / rng + 1) / 2 * PAD
+                col = "#aaa" if t == 0 else "#444"               # the two axes are brighter
+                cv.create_line(p, 0, p, PAD, fill=col); cv.create_line(0, p, PAD, p, fill=col)
+            cv.create_text(4, 2, text=label, anchor="nw", fill="#ddd", font=("TkDefaultFont", 9, "bold"))   # which constant
+            z = self.val[key]
+            out = abs(z.real) > rng or abs(z.imag) > rng         # typed value outside the pad?
+            x, y = to_px(z)
+            x, y = min(max(x, 3), PAD - 3), min(max(y, 3), PAD - 3)
+            cv.create_oval(x - 4, y - 4, x + 4, y + 4, fill="red" if out else "yellow", outline="black")
+
+        def set_value(z, update_box=True):
+            if z == self.val[key]: return
+            self.val[key] = z
+            if update_box: sv.set(fmt_complex(z))
+            draw(); self.schedule()
+
+        def on_drag(ev):                                          # click / drag on the pad
+            x, y = min(max(ev.x, 0), PAD), min(max(ev.y, 0), PAD)  # keep the mouse inside while dragging outside
+            z = from_px(x, y)
+            set_value(complex(round(z.real, 2), round(z.imag, 2)))  # snap to 0.01 so the box stays tidy
+
+        def on_entry(_=None):
+            try: z = eval_box(sv.get())
+            except Exception as err:
+                sv.set(fmt_complex(self.val[key])); self.status.set(f"Constant {label}: {err}"); return
+            set_value(z, update_box=False)                        # keep the typed text as it is
+
+        cv.bind("<Button-1>", on_drag); cv.bind("<B1-Motion>", on_drag)
+        ent.bind("<Return>", on_entry); ent.bind("<FocusOut>", on_entry)
+        draw()
 
     def current_tf(self):
         """The Transform selected in the drop-down (the compiled formula for 'custom')."""
