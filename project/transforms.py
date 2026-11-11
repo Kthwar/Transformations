@@ -135,7 +135,6 @@ def _tan_i(w, p):
     a = np.arctan(w + 0j)
     return [(a + np.pi * k, np.isfinite(a)) for k in sheet_indices(p)]
 
-
 # Registry shown in the UI's drop-down list (name -> Transform).
 TRANSFORMS = {t.name: t for t in [
     Transform("identity", _id_f, _id_i, 2.0),
@@ -173,7 +172,7 @@ def _compile(expr, var):
             ns.update(consts)               # ... and are overridden by the current slider values
         ns[var] = x                         # the variable (z or w)
         ns["k"] = k                         # sheet index (only meaningful for inverses)
-        return eval(code, {"__builtins__": {}}, ns) + 0 * x      # "+ 0*x" broadcasts constants
+        return eval(code, {"__builtins__": __builtins__}, ns) + 0 * x
     return fn
 
 
@@ -196,7 +195,7 @@ def _newton(f, w, z0, iters=40):
     return z, ok
 
 
-def make_custom(expr, mode):
+def make_custom(expr, mode, consts=None):
     """mode 'inverse': expr is f^-1(w) (may use k for multi-valued sheets) -> used directly.
        mode 'forward': expr is f(z) -> inverted numerically by Newton from several start points;
        each start point can land on a different preimage (= a different 'sheet').  Cuts ON uses
@@ -207,7 +206,10 @@ def make_custom(expr, mode):
        here: they are read from `p.consts` every time the map is evaluated, so moving a
        slider changes the picture without re-applying the formula."""
     f = _compile(expr, "w" if mode == "inverse" else "z")
-    f(np.array([0.5 + 0.5j]))                     # fail early on typos / unknown names
+    f(
+        np.array([0.5 + 0.5j]),
+        consts=consts or DEFAULT_CONSTS
+    )
     if mode == "inverse":
         def inv(w, p):
             for k in sheet_indices(p):            # one sheet per k, nearest first

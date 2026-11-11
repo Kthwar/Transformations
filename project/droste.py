@@ -195,8 +195,39 @@ def droste_polygon(z, dp):
             break
         z[inside] = back(z[inside])
     return z
+  
+def droste_polygon_fixed_points(dp):
+    P = dp.poly
+    if len(P) < 3:
+        return []
+    quad_in, _ = _input_frame(dp)
+    quad_out = P if len(P) == 4 else _fit_rect(P, _quad_aspect(quad_in))
+    Hm = homography(quad_out, quad_in)            # same matrix the renderer uses
 
+    cx, cy = quad_in.mean().real, quad_in.mean().imag
+    co, si = np.cos(dp.psi), np.sin(dp.psi)
+    # multiplication by e^{-i psi} about the input centre, as a 3x3 matrix
+    R = np.array([[ co, si, cx - ( co * cx + si * cy)],
+                  [-si, co, cy - (-si * cx + co * cy)],
+                  [0.0, 0.0, 1.0]])
+    M = R @ Hm                                    # = back(): homography, then rotation
+
+    vals, vecs = np.linalg.eig(M)
+    pts = []
+    for k in range(3):
+        if abs(vals[k].imag) > 1e-9:              # complex pair -> no real fixed point
+            continue
+        v = vecs[:, k]
+        if abs(v[2]) < 1e-12 * np.linalg.norm(v): # w = 0 -> point at infinity
+            continue
+        v = v / v[2]
+        pts.append(complex(v[0].real, v[1].real))
+    return pts
 
 def droste_pullback(z, dp):
     """Dispatch to the chosen model."""
+    centres = droste_polygon_fixed_points(dp)
+    for sexo in centres:
+        print(f"Fixed point: x={2*sexo.real}, y={2*sexo.imag}")
+        print("Inside output frame:", in_polygon(np.array([sexo]), dp.poly)[0])
     return {"annulus": droste_annulus, "disc": droste_disc, "polygon": droste_polygon}[dp.model](z, dp)
