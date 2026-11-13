@@ -7,13 +7,34 @@ render.py -- the rendering pipeline.
   FORWARD (demo):     source pixel -> z -> w = f(z) -> output pixel.  Source is oversampled to
                       reduce -- but cannot eliminate -- holes where f stretches the plane.
 Output is RGBA: alpha = fraction of (sub)samples that hit the picture (0 = void).
+
+PERIOD STACKING (optional, `PeriodParams`): the finished output is repeated as copies shifted by
+n*T (T = any complex number, n = -n_neg .. +n_pos) and the copies are LAYERED over each other.
+A copy is transparent where it is void, so the next copy shows through.  Where several copies
+have picture at the same pixel, the one whose point lies FARTHEST from the centre of the
+original picture is on top.  This is plain translation of the final result, not a Droste effect.
 """
+from dataclasses import dataclass
 import numpy as np
 from PIL import Image
 from coords import Region, pixel_to_complex, complex_to_pixel
 from droste import droste_pullback
 
 NORM = Region(0j, 2.0, 0.0)   # picture-local frame: picture spans x in [-1, 1]
+
+
+@dataclass
+class PeriodParams:
+    """Repeat the finished OUTPUT as stacked copies shifted by n*T, n = -n_neg .. +n_pos.
+    T is ANY complex number: a real T is a plain horizontal frieze, T = 2-0.3i repeats the
+    picture a little bit downward, ... (a pure translation: no rotation, no scaling).
+    `centre` = the point of the ORIGINAL picture (plane coordinates; where f(z) blows up,
+    i.e. z = 0 for ln) that decides who is on top: the farthest point from it wins."""
+    enabled: bool = False
+    T: complex = 2 + 0j
+    n_neg: int = 2            # copies at -T, -2T, ...
+    n_pos: int = 2            # copies at +T, +2T, ...
+    centre: complex = 0j
 
 
 def load_image(path, max_side=1500):
@@ -50,13 +71,60 @@ def _rgba(rgb, alpha):
     return np.dstack([rgb, alpha[..., None] * 255]).clip(0, 255).astype(np.uint8)
 
 
-def render_inverse(src, tf, tp, dp, src_region, out_region, out_size, ss=1):
+def _shade(w, src, tf, tp, dp, src_region, centre):
+    """Colour of the picture seen at the output-plane points w (the existing pipeline: f^-1 on each
+    sheet, nearest sheet first -> Droste pull-back -> bilinear sample).
+    Returns (color, filled, dist).  dist = |z - centre| of the plane point that supplied the colour
+    (z = f^-1(w), BEFORE the Droste pull-back, so it measures the distance from the centre in the
+    picture as it is shown); only computed when `centre` is given."""
+    sh, sw = src.shape[:2]
+    filled = np.zeros(w.shape, bool)                       # pixels that already got a colour
+    color = np.zeros(w.shape + (3,), np.float32)
+    dist = np.full(w.shape, -np.inf)
+    for z, ok in tf.inverse(w, tp):                        # nearest sheet first; first hit wins
+        if filled.all():                                   # everything painted -> farther sheets are not needed
+            break
+        zl = to_local(z, src_region)                       # plane point -> picture-local coordinates
+        if dp.enabled:
+            zl = droste_pullback(zl, dp)                   # recursive "picture in picture"
+        px, py = complex_to_pixel(zl, sw, sh, NORM)        # picture-local -> source pixel
+        c, valid = bilinear_sample(src, px, py)
+        take = ok & valid & ~filled                        # sheet is valid here, hits the picture, pixel still empty
+        color[take] = c[take]
+        if centre is not None:
+            dist[take] = np.abs(z - centre)[take]
+        filled |= take
+    return color, filled, dist
+
+
+def _stack_copies(w, shade, period):
+    """Layer the copies n*T (n = -n_neg .. +n_pos).  Copy n shows, at the output point w, whatever the
+    single picture shows at w - n*T.  Void parts of a copy are transparent, so a neighbouring copy shows
+    through there.  Where several copies have picture, the one whose source point is FARTHEST from the
+    centre of the original picture is on top (the outer part of a copy covers the inner part of its neighbour)."""
+    color = np.zeros(w.shape + (3,), np.float32)
+    filled = np.zeros(w.shape, bool)
+    best = np.full(w.shape, -np.inf)                       # distance of the current winner at every pixel
+    for n in range(-period.n_neg, period.n_pos + 1):
+        c, f, d = shade(w - n * period.T)
+        d = np.where(np.isfinite(d), d, -np.inf)
+        win = f & (~filled | (d > best))                   # first picture seen, or farther from the centre
+        color[win] = c[win]
+        best[win] = d[win]
+        filled |= win
+    return color, filled
+
+
+def render_inverse(src, tf, tp, dp, src_region, out_region, out_size, ss=1, period=None):
     """Paint the output by pulling colours back from the source picture.
     src = picture, tf = Transform, tp = TParams, dp = DrosteParams,
     src_region / out_region = where the picture / the output window lie in the plane,
-    out_size = (width, height) px, ss = supersampling factor (ss x ss samples per pixel)."""
-    sh, sw = src.shape[:2]
+    out_size = (width, height) px, ss = supersampling factor (ss x ss samples per pixel),
+    period = optional PeriodParams: stack translated copies of the finished output (see module docstring)."""
     ow, oh = out_size
+    stack = period is not None and period.enabled and period.T != 0
+    centre = period.centre if stack else None
+    shade = lambda x: _shade(x, src, tf, tp, dp, src_region, centre)
     # acc = sum of the colours of all hitting samples, cnt = how many samples hit the picture
     acc, cnt = np.zeros((oh, ow, 3), np.float32), np.zeros((oh, ow), np.float32)
     with np.errstate(all="ignore"):                # log(0), division by zero ... are expected; NaN just means "void"
@@ -65,19 +133,10 @@ def render_inverse(src, tf, tp, dp, src_region, out_region, out_size, ss=1):
                 # pixel grid shifted by the sub-pixel offset of this sample
                 jj, ii = np.meshgrid(np.arange(ow) + (sx + .5) / ss - .5, np.arange(oh) + (sy + .5) / ss - .5)
                 w = pixel_to_complex(jj, ii, ow, oh, out_region)      # output pixel -> point w of the output plane
-                filled = np.zeros((oh, ow), bool)                      # pixels that already got a colour
-                color = np.zeros((oh, ow, 3), np.float32)
-                for z, ok in tf.inverse(w, tp):    # nearest sheet first; first hit wins
-                    if filled.all():               # everything painted -> farther sheets are not needed
-                        break
-                    zl = to_local(z, src_region)   # plane point -> picture-local coordinates
-                    if dp.enabled:
-                        zl = droste_pullback(zl, dp)                   # recursive "picture in picture"
-                    px, py = complex_to_pixel(zl, sw, sh, NORM)        # picture-local -> source pixel
-                    c, valid = bilinear_sample(src, px, py)
-                    take = ok & valid & ~filled    # sheet is valid here, hits the picture, pixel still empty
-                    color[take] = c[take]
-                    filled |= take
+                if stack:
+                    color, filled = _stack_copies(w, shade, period)
+                else:
+                    color, filled, _ = shade(w)
                 acc += color
                 cnt += filled
     # average colour over the samples that hit; alpha = fraction of samples that hit

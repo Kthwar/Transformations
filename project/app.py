@@ -8,6 +8,15 @@ Droste model C has TWO polygons you can draw on the original (choose which one w
     output frame (cyan)   = where the inner copy is placed
     input frame  (orange) = which part of the picture the copy shows (empty = whole picture)
 The custom formula can use the constants a, b, c, d, each controlled by its own slider.
+
+PERIOD REPEAT (left column, "Repeat the output period"): draw a line on the RESULT canvas from a point
+to the same feature one repeat further (or type the complex vector T: it need not be horizontal, e.g.
+2-0.3i repeats the picture a bit downward).  The finished output is then copied at T, 2T, ... and -T,
+-2T, ... and the copies are layered: void parts are transparent, and where copies overlap the point
+FARTHEST from the "Priority centre" (the centre of the original picture, z = 0 for ln) is on top.
+Right-click on the result canvas cancels a half-drawn line.
+MOVE THE COPIES BY HAND: with "Repeat period ON", drag on the result canvas (the first copy toward +T follows
+the mouse; T updates live), or click the canvas and use the arrow keys (1 preview pixel, Shift = 5).
 """
 import cmath
 import math
@@ -16,10 +25,10 @@ import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 import numpy as np
 from PIL import Image, ImageTk
-from coords import Region
+from coords import Region, pixel_to_complex, complex_to_pixel
 from transforms import TRANSFORMS, TParams, make_custom, CONST_NAMES, DEFAULT_CONSTS
 from droste import DrosteParams
-from render import load_image, render_inverse, render_forward, composite_preview
+from render import load_image, render_inverse, render_forward, composite_preview, PeriodParams
 
 BASE_W, PREVIEW = 4.0, 420    # picture is BASE_W plane-units wide at zoom 1; PREVIEW = canvas size in px
 PAD, PAD_RANGE, PAD_COLS = 160, 5.0, 4   # 2D constant pads: size in px, covers -PAD_RANGE..PAD_RANGE on both axes,
@@ -67,6 +76,8 @@ class App:
         self.val, self.chk, self.custom_tf, self.poly, self.poly_in = {}, {}, None, [], []
         self.dw = self.dh = PREVIEW; self.ah = 1.0           # displayed size / aspect of the original
         self.ox = self.oy = 0                                  # image centering offsets on canvas
+        self.drag, self.drag_job = None, None                  # hand-moving the copies: (mouse start point, T at start); pending live-render job
+        self.picking, self.pick_p1, self.per_anchor = 0, None, None   # period line: 0 idle / 1 wait start / 2 wait end; its start; arrow start
         root.title("TMA: complex maps and Droste effect")
 
         # ---- the two image canvases (left: original, right: result) ----
@@ -76,6 +87,12 @@ class App:
         self.cv_in.pack(side="left", padx=4); self.cv_out.pack(side="left", padx=4)
         self.cv_in.bind("<Button-1>", self.add_point)                         # left click adds a polygon point
         for b in ("<Button-2>", "<Button-3>"): self.cv_in.bind(b, self.pop_point)   # right/middle click undoes
+        self.cv_out.bind("<Button-1>", self.on_out_click)                     # period line: 1st click = start, 2nd = end
+        self.cv_out.bind("<Motion>", self.on_out_motion)                      # rubber band while the line is half drawn
+        self.cv_out.bind("<B1-Motion>", self.on_out_drag)                     # drag = move the copies (T follows the mouse)
+        self.cv_out.bind("<ButtonRelease-1>", self.on_out_release)
+        self.cv_out.bind("<Key>", self.on_out_key)                            # arrow keys nudge T (canvas must have focus: click it)
+        for b in ("<Button-2>", "<Button-3>"): self.cv_out.bind(b, self.cancel_pick)
         self.status = tk.StringVar()                                          # red error line under the canvases
         ttk.Label(root, textvariable=self.status, foreground="#a00").pack()
 
@@ -92,6 +109,17 @@ class App:
                   ("ocy", "Output centre y", -10, 10, 0, .1),
                   ("ozoom", "Output zoom", .1, 20, 1, .05)]:      # <-- new
             self.slider(cols[0], *s)
+        # Repeat the finished output as stacked copies shifted by the complex vector T.
+        pf = ttk.LabelFrame(cols[0], text="Repeat the output period"); pf.pack(fill="x", pady=4)
+        self.check(pf, "per", "Repeat period ON", False)
+        ttk.Button(pf, text="Draw period line on result (2 clicks)", command=self.start_pick).pack(fill="x")
+        self.set_T = self.cbox(pf, "T", "Period T (complex)", 2.0)
+        self.cbox(pf, "pc", "Priority centre", 0j)
+        for s in [("nneg", "Copies toward -T", 0, 8, 2, 1), ("npos", "Copies toward +T", 0, 8, 2, 1)]:
+            self.slider(pf, *s)
+        ttk.Label(pf, text="Drag on the result (or click it + arrow keys, Shift = x5)\n"
+                           "to move the copies.  Where copies overlap, the point\n"
+                           "farthest from the priority centre is on top.").pack(anchor="w")
 
         # Column 1: choice of the complex function + custom formula + branch-cut settings.
         c1 = cols[1]
@@ -228,6 +256,31 @@ class App:
         ent.bind("<Return>", on_entry); ent.bind("<FocusOut>", on_entry)
         draw()
 
+    def cbox(self, parent, key, label, default):
+        """Number box for a COMPLEX value ('2-0.3i', '2*exp(-i*0.1)').  self.val[key] is the source of truth.
+        Returns a function set(z) to change the value from code (updates the box and redraws)."""
+        self.val[key] = complex(default)
+        row = ttk.Frame(parent); row.pack(fill="x")
+        ttk.Label(row, text=label, width=20).pack(side="left")
+        sv = tk.StringVar(value=fmt_complex(self.val[key]))
+        ent = ttk.Entry(row, textvariable=sv, width=14); ent.pack(side="left")
+
+        def set_value(z, update_box=True, redraw=True):
+            if z == self.val[key]: return
+            self.val[key] = z
+            if update_box: sv.set(fmt_complex(z))
+            if redraw: self.schedule()
+
+        def on_entry(_=None):
+            if sv.get() == fmt_complex(self.val[key]): return     # text untouched (keeps full precision of a drawn value)
+            try: z = eval_box(sv.get())
+            except Exception as err:
+                sv.set(fmt_complex(self.val[key])); self.status.set(f"'{label}': {err}"); return
+            set_value(z, update_box=False)
+
+        ent.bind("<Return>", on_entry); ent.bind("<FocusOut>", on_entry)
+        return set_value
+
     def current_tf(self):
         """The Transform selected in the drop-down (the compiled formula for 'custom')."""
         if self.combo.get() == "custom":
@@ -269,6 +322,84 @@ class App:
     def clear_poly(self): self.poly.clear(); self.schedule()        # forget the output frame
     def clear_poly_in(self): self.poly_in.clear(); self.schedule()  # forget the input frame
 
+    # ---- period line on the RESULT canvas (output-plane coordinates) -----------------
+    def out_region(self):
+        """The window of the output plane that the result canvas shows (never rotated)."""
+        g = self.val
+        return Region(complex(g["ocx"], g["ocy"]), 4 / g["ozoom"], 0.0)
+
+    def out_to_plane(self, x, y):
+        """Result-canvas pixel -> point of the output plane."""
+        return pixel_to_complex(x - .5, y - .5, PREVIEW, PREVIEW, self.out_region())
+
+    def plane_to_out(self, z):
+        """Point of the output plane -> result-canvas pixel."""
+        px, py = complex_to_pixel(z, PREVIEW, PREVIEW, self.out_region())
+        return px + .5, py + .5
+
+    def start_pick(self):
+        """Button: the next two clicks on the result canvas define the period vector T."""
+        if self.src is None: self.status.set("Open an image first."); return
+        self.picking, self.pick_p1 = 1, None
+        self.status.set("Period line: click a feature on the result (START).  Right-click cancels.")
+
+    def cancel_pick(self, _=None):
+        self.picking, self.pick_p1 = 0, None
+        self.cv_out.delete("rub"); self.status.set(""); self.draw_overlays()
+
+    def on_out_click(self, ev):
+        """1st click = start of the period line, 2nd click = the same feature one repeat further; T = end - start."""
+        if not self.picking:                                  # no line being drawn: start moving the copies by hand
+            self.cv_out.focus_set()                           # so that the arrow keys reach the canvas
+            if self.src is not None and self.chk["per"].get() and not self.chk["fwd"].get():
+                self.drag = (self.out_to_plane(ev.x, ev.y), self.val["T"])
+            return
+        p = self.out_to_plane(ev.x, ev.y)
+        if self.picking == 1:
+            self.pick_p1, self.picking = p, 2
+            self.status.set("Period line: now click the SAME feature one repeat further (END).")
+            self.draw_overlays(); return
+        T = p - self.pick_p1
+        self.picking = 0; self.cv_out.delete("rub")
+        if abs(T) < 1e-9:
+            self.status.set("The period line has zero length."); self.draw_overlays(); return
+        self.per_anchor = self.pick_p1
+        self.set_T(T); self.chk["per"].set(True); self.status.set(""); self.schedule()
+
+    def on_out_drag(self, ev):
+        """Mouse moved with the button down: T = T at the start + mouse movement (in plane units), so the first
+        copy toward +T (and every copy, proportionally) follows the mouse.  Live preview at half resolution."""
+        if self.drag is None: return
+        p0, T0 = self.drag
+        self.set_T(T0 + (self.out_to_plane(ev.x, ev.y) - p0), redraw=False)      # updates the T box, no full redraw yet
+        if self.drag_job is None:                                                # coalesce motion events
+            self.drag_job = self.root.after(30, self.drag_render)
+
+    def drag_render(self):
+        self.drag_job = None
+        self.redraw(fast=True)
+
+    def on_out_release(self, _):
+        """Button released: forget the drag and draw the full-quality picture."""
+        if self.drag is None: return
+        self.drag = None
+        if self.drag_job is not None: self.root.after_cancel(self.drag_job); self.drag_job = None
+        self.schedule()
+
+    def on_out_key(self, ev):
+        """Arrow keys nudge T by one preview pixel (Shift = 5 pixels): Up/Down move the copies up/down."""
+        step = {"Left": -1, "Right": 1, "Up": 1j, "Down": -1j}.get(ev.keysym)
+        if step is None or not self.chk["per"].get(): return
+        px = 4 / self.val["ozoom"] / PREVIEW * (5 if ev.state & 1 else 1)      # one preview pixel in plane units
+        self.set_T(self.val["T"] + step * px)
+
+    def on_out_motion(self, ev):
+        """Rubber band from the start point to the mouse while the line is half drawn."""
+        if self.picking != 2: return
+        self.cv_out.delete("rub")
+        x0, y0 = self.plane_to_out(self.pick_p1)
+        self.cv_out.create_line(x0, y0, ev.x, ev.y, fill="yellow", width=2, arrow="last", tags="rub")
+
     # ---- rendering -------------------------------------------------------------------
     def render(self, size, ss, fwd_over=2):
         """Collect all UI settings into parameter objects and run the renderer.
@@ -290,22 +421,28 @@ class App:
                           min(1.0, asp), asp, np.array(self.poly, dtype=complex),
                           np.array(self.poly_in, dtype=complex))
         # the window of the output plane that is shown (never rotated)
-        out_region = Region(complex(g("ocx"), g("ocy")), 4 / g("ozoom"), 0.0)
+        out_region = self.out_region()
         if fwd:
             return render_forward(self.src, tf, tp, src_region, out_region, size, fwd_over)
-        return render_inverse(self.src, tf, tp, dp, src_region, out_region, size, ss)
+        # stacked copies of the finished output (T = any complex vector; priority = farthest from the centre)
+        per = PeriodParams(self.chk["per"].get() and g("T") != 0, g("T"), int(g("nneg")), int(g("npos")), g("pc"))
+        return render_inverse(self.src, tf, tp, dp, src_region, out_region, size, ss, period=per)
 
     def schedule(self, *_):
         """Debounce: redraw 150 ms after the LAST change, so dragging a slider stays smooth."""
         if self.pending: self.root.after_cancel(self.pending)
         self.pending = self.root.after(150, self.redraw)
 
-    def redraw(self):
-        """Render a preview into the right canvas, then refresh the overlays on both canvases."""
+    def redraw(self, fast=False):
+        """Render a preview into the right canvas, then refresh the overlays on both canvases.
+        fast=True (used while dragging the copies): half-resolution, no supersampling, scaled up."""
         if self.src is None: return
         try:
-            rgba = self.render((PREVIEW, PREVIEW), int(self.val["ss"])); self.status.set("")
-            self.tk_out = ImageTk.PhotoImage(composite_preview(rgba))   # keep a reference or Tk drops the image
+            n = PREVIEW // 2 if fast else PREVIEW
+            rgba = self.render((n, n), 1 if fast else int(self.val["ss"])); self.status.set("")
+            im = composite_preview(rgba)
+            if fast: im = im.resize((PREVIEW, PREVIEW))
+            self.tk_out = ImageTk.PhotoImage(im)                        # keep a reference or Tk drops the image
             self.cv_out.delete("img"); self.cv_out.create_image(0, 0, anchor="nw", image=self.tk_out, tags="img")
         except Exception as e:
             self.status.set(f"{type(e).__name__}: {e}")
@@ -320,6 +457,15 @@ class App:
             self.cv_out.create_line(PREVIEW / 2, 0, PREVIEW / 2, PREVIEW, fill="red", tags="ov")
             self.cv_out.create_line(0, PREVIEW / 2, PREVIEW, PREVIEW / 2, fill="red", tags="ov")
         if self.src is None: return
+        if self.picking == 2 and self.pick_p1 is not None:           # start point of a half-drawn period line
+            x, y = self.plane_to_out(self.pick_p1)
+            self.cv_out.create_oval(x - 4, y - 4, x + 4, y + 4, fill="yellow", outline="black", tags="ov")
+        elif self.chk["per"].get() and not self.chk["fwd"].get():    # the period vector T as an arrow
+            T = self.val["T"]
+            a = self.per_anchor if self.per_anchor is not None else self.out_region().center - T / 2
+            (x0, y0), (x1, y1) = self.plane_to_out(a), self.plane_to_out(a + T)
+            self.cv_out.create_line(x0, y0, x1, y1, fill="yellow", width=2, arrow="last", tags="ov")
+            self.cv_out.create_oval(x0 - 3, y0 - 3, x0 + 3, y0 + 3, fill="yellow", outline="black", tags="ov")
         m, v = self.model.get(), self.val
         # models A and B: show the circles (solid = r1 or rho, dashed = r2) on the original
         if self.chk["dr"].get() and m in ("annulus", "disc"):
